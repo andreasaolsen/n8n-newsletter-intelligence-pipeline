@@ -1,1 +1,945 @@
-
+{
+  "name": "Newsletter Intelligence Pipeline",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -960,
+        0
+      ],
+      "id": "cd1f6ee5-a711-4bee-953b-d39101743b32",
+      "name": "When clicking ‘Execute workflow’"
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "limit": 30,
+        "filters": {
+          "q": "from:(newsletter1@example.com OR newsletter2@example.com OR newsletter3@example.com)"
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        -768,
+        0
+      ],
+      "id": "fb70c831-2358-4819-b199-92a7033caa95",
+      "name": "Get many messages",
+      "webhookId": "e321f794-551b-4bda-970e-c8ba1c626aca",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "YOUR_GMAIL_CREDENTIAL_ID",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nfunction decodeBase64(data) {\n  if (!data) return '';\n\n  const normalized = data\n    .replace(/-/g, '+')\n    .replace(/_/g, '/');\n\n  return Buffer.from(normalized, 'base64').toString('utf8');\n}\n\nfunction findTextPart(payload) {\n  if (!payload) return '';\n\n  if (payload.body?.data) {\n    return decodeBase64(payload.body.data);\n  }\n\n  if (Array.isArray(payload.parts)) {\n    // Prefer plain text\n    for (const part of payload.parts) {\n      if (part.mimeType === 'text/plain' && part.body?.data) {\n        return decodeBase64(part.body.data);\n      }\n    }\n\n    // Otherwise search recursively\n    for (const part of payload.parts) {\n      const result = findTextPart(part);\n      if (result) return result;\n    }\n  }\n\n  return '';\n}\n\nfunction getHeader(headers, name) {\n  if (!Array.isArray(headers)) return '';\n\n  const header = headers.find(\n    h => h.name && h.name.toLowerCase() === name.toLowerCase()\n  );\n\n  return header?.value || '';\n}\n\nreturn items.map(item => {\n  const data = item.json;\n\n  const headers = data.payload?.headers || [];\n\n  const content = findTextPart(data.payload);\n\n  return {\n    json: {\n      id: data.id || '',\n      threadId: data.threadId || '',\n\n      sender: getHeader(headers, 'From'),\n      recipient: getHeader(headers, 'To'),\n      subject: getHeader(headers, 'Subject'),\n      date: getHeader(headers, 'Date'),\n\n      content: content\n    }\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        608,
+        0
+      ],
+      "id": "d2015de1-da37-4cdd-a51f-32be14966595",
+      "name": "Clean & Extract Email"
+    },
+    {
+      "parameters": {
+        "url": "=https://gmail.googleapis.com/gmail/v1/users/me/messages/{{ $json.id }}?format=full",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "gmailOAuth2",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        416,
+        0
+      ],
+      "id": "af38a620-809c-439b-a01c-49d79ac31920",
+      "name": "Get Full Email",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "YOUR_GMAIL_CREDENTIAL_ID",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map(item => {\n  const data = item.json;\n\n  return {\n    json: {\n      newsletter_id: data.id || '',\n      sender: data.sender || '',\n      recipient: data.recipient || '',\n      subject: data.subject || '',\n      date: data.date || '',\n      content: data.content || ''\n    }\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        816,
+        0
+      ],
+      "id": "e7c1553b-c506-4701-b614-aecf79064dc0",
+      "name": "Prepare Newsletter"
+    },
+    {
+      "parameters": {
+        "jsCode": "function collectParts(part, result = []) {\n  if (!part) return result;\n\n  if (part.mimeType) {\n    result.push(part);\n  }\n\n  if (Array.isArray(part.parts)) {\n    for (const child of part.parts) {\n      collectParts(child, result);\n    }\n  }\n\n  return result;\n}\n\nfunction extractImageUrls(html) {\n  if (!html) return [];\n\n  const urls = [];\n\n  const regex = /<img[^>]+src=[\"']([^\"']+)[\"']/gi;\n  let match;\n\n  while ((match = regex.exec(html)) !== null) {\n    urls.push(match[1]);\n  }\n\n  return [...new Set(urls)];\n}\n\nreturn $input.all().map(item => {\n  const data = item.json;\n  const payload = data.payload || {};\n\n  const parts = collectParts(payload);\n\n  // Find image MIME parts\n  const imageParts = parts\n    .filter(part => part.mimeType && part.mimeType.startsWith('image/'))\n    .map(part => ({\n      mimeType: part.mimeType,\n      filename: part.filename || '',\n      attachmentId: part.body?.attachmentId || '',\n      size: part.body?.size || 0,\n      contentId: part.headers?.find(\n        h => h.name?.toLowerCase() === 'content-id'\n      )?.value || ''\n    }));\n\n  // Find HTML parts\n  const htmlParts = parts.filter(\n    part => part.mimeType === 'text/html'\n  );\n\n  const imageUrls = [];\n\n  for (const part of htmlParts) {\n    // Gmail API body.data may contain base64url encoded HTML\n    if (part.body?.data) {\n      try {\n        const html = Buffer.from(\n          part.body.data\n            .replace(/-/g, '+')\n            .replace(/_/g, '/'),\n          'base64'\n        ).toString('utf8');\n\n        imageUrls.push(...extractImageUrls(html));\n      } catch (error) {\n        // Ignore malformed HTML encoding\n      }\n    }\n  }\n\n  return {\n    json: {\n      id: data.id || '',\n      threadId: data.threadId || '',\n      sender: data.sender || '',\n      recipient: data.recipient || '',\n      subject: data.subject || '',\n      date: data.date || '',\n\n      imageParts,\n\n      imageUrls: [...new Set(imageUrls)],\n\n      imageCount:\n        imageParts.length +\n        [...new Set(imageUrls)].length\n    }\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        288
+      ],
+      "id": "cc82a69d-84f0-4f4e-bb96-c7c3ce4da070",
+      "name": "Extract Images"
+    },
+    {
+      "parameters": {
+        "jsCode": "const output = [];\n\nconst items = $input.all();\n\nfor (let i = 0; i < items.length; i++) {\n  const item = items[i];\n  const data = item.json;\n  const imageUrls = data.imageUrls || [];\n\n  for (let j = 0; j < imageUrls.length; j++) {\n    const imageUrl = imageUrls[j];\n\n    output.push({\n      json: {\n        emailId: data.id,\n        image_id: `${data.id}_image_${j + 1}`,\n        image_number: j + 1,\n        sender: data.sender,\n        subject: data.subject,\n        date: data.date,\n        imageUrl: imageUrl\n      },\n\n      pairedItem: {\n        item: i\n      }\n    });\n  }\n}\n\nreturn output;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        848,
+        288
+      ],
+      "id": "d97654ce-f26c-46be-8be0-2d664dfdcbbd",
+      "name": "Split Images"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.imageUrl }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1056,
+        288
+      ],
+      "id": "c364cb3f-6a70-4ef3-bfb5-3c5846630f80",
+      "name": "Download Image"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nreturn items.filter(item => {\n  const binary = item.binary?.data;\n\n  if (!binary) {\n    return false;\n  }\n\n  const mimeType = binary.mimeType || '';\n  const fileSize = binary.fileSize || '';\n\n  // Only keep actual image formats\n  const validImage = [\n    'image/jpeg',\n    'image/png',\n    'image/webp',\n    'image/gif'\n  ].includes(mimeType.toLowerCase());\n\n  // Convert n8n file size to bytes\n  const match = fileSize.match(/^([\\d.]+)\\s*(B|KB|MB|GB)$/i);\n\n  if (!match) {\n    return false;\n  }\n\n  const size = parseFloat(match[1]);\n  const unit = match[2].toUpperCase();\n\n  const multipliers = {\n    B: 1,\n    KB: 1024,\n    MB: 1024 * 1024,\n    GB: 1024 * 1024 * 1024\n  };\n\n  const sizeInBytes = size * multipliers[unit];\n\n  // Remove tiny tracking pixels and technical images\n  return validImage && sizeInBytes > 5000;\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1264,
+        288
+      ],
+      "id": "db1c76eb-8984-41c2-a3e5-1ecf94fcab14",
+      "name": "Filter Images"
+    },
+    {
+      "parameters": {
+        "resource": "image",
+        "operation": "analyze",
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list",
+          "cachedResultName": "GPT-4O"
+        },
+        "text": "You are a visual marketing analyst.\n\nAnalyze ONLY the image provided.\n\nDo not infer or invent information about the newsletter that cannot be determined from the image itself.\n\nReturn ONLY valid JSON with exactly these fields:\n\n{\n  \"visual_strategy\": \"\",\n  \"visual_style\": \"\",\n  \"image_usage\": \"\",\n  \"text_image_balance\": \"\",\n  \"visual_hierarchy\": \"\",\n  \"branding_elements\": \"\",\n  \"imagery_subject\": \"\"\n}\n\nAnalyze:\n\n1. visual_strategy\nDescribe the marketing purpose of the visual.\n\n2. visual_style\nDescribe the visual design, composition, photography/illustration style, typography and overall aesthetic.\n\n3. image_usage\nExplain how the image is being used within the newsletter.\n\n4. text_image_balance\nDescribe the relationship between text and visual elements.\n\n5. visual_hierarchy\nDescribe what attracts attention first, second and third.\n\n6. branding_elements\nIdentify visible brand elements such as logo, colors, typography or other recognizable visual branding.\n\n7. imagery_subject\nDescribe what the image actually depicts.\n\nIf a field cannot be determined from the image, use an empty string.\n\nDo not analyze the newsletter's overall goal, audience, offer, CTA, persuasion strategy or marketing strategy.\nThose will be analyzed separately from the newsletter text.",
+        "inputType": "base64",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        1472,
+        288
+      ],
+      "id": "c7bafbd5-1e5b-4077-9b59-a09276d6fde3",
+      "name": "Analyze image",
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "GPT-4O-MINI"
+        },
+        "responses": {
+          "values": [
+            {
+              "content": "=You are a marketing analyst working in a professional marketing department.\n\nAnalyze the newsletter as part of a structured competitive marketing analysis.\n\nUse the sender, subject and newsletter content together. Base the analysis only on the information provided. Make reasonable marketing inferences when they are strongly supported by the content, but do not invent facts.\n\nReturn ONLY valid JSON using exactly this structure:\n\n{\n  \"newsletter_type\": \"\",\n  \"primary_goal\": \"\",\n  \"target_audience\": \"\",\n  \"main_product_or_service\": \"\",\n  \"main_offer\": \"\",\n  \"value_proposition\": \"\",\n  \"key_messages\": [],\n  \"call_to_actions\": [],\n  \"persuasion_techniques\": [],\n  \"urgency_or_scarcity\": \"\",\n  \"tone_of_voice\": \"\",\n  \"copywriting_style\": \"\",\n  \"content_structure\": \"\",\n  \"promotional_strategy\": \"\",\n  \"brand_positioning\": \"\",\n  \"customer_motivation\": \"\",\n  \"marketing_patterns\": []\n}\n\nGuidelines:\n\n- Identify the likely type of newsletter.\n- Identify the primary marketing objective.\n- Identify the likely target audience.\n- Identify the product, service, event, content or offer being promoted.\n- Describe the main offer and value proposition.\n- Extract the most important marketing messages.\n- Identify meaningful calls to action.\n- Identify persuasion techniques such as discounts, urgency, scarcity, exclusivity, social proof, curiosity, emotional appeal, authority, benefits or price anchoring.\n- Identify how urgency or scarcity is used, if at all.\n- Analyze the tone of voice and copywriting style.\n- Describe how the content is structured and how the reader is guided through the newsletter.\n- Identify the underlying promotional strategy.\n- Describe how the brand is positioned.\n- Identify the customer motivation or problem the newsletter addresses.\n- Identify reusable marketing patterns that could be applied to other campaigns.\n- Keep descriptions concise.\n- If something genuinely cannot be determined, use an empty string or empty array.\n\nSender:\n{{ $json.sender }}\n\nSubject:\n{{ $json.subject }}\n\nNewsletter content:\n{{ $json.content }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        1024,
+        0
+      ],
+      "id": "1a13763b-34dc-43ed-9a26-81406ecf0ce5",
+      "name": "Message a model",
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "60b4ef21-e5b9-43b1-a887-ebe3bd719125",
+              "name": "newsletter_id",
+              "value": "={{ $json.id }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        240,
+        0
+      ],
+      "id": "8eaf9141-084c-49e3-9321-c7c32043d77d",
+      "name": "Edit Fields"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\n// Hent alle items fra Filter Images\nconst filterItems = $('Filter Images').all();\n\nconst imageAnalyses = [];\n\nfor (let i = 0; i < items.length; i++) {\n\n  const item = items[i];\n\n  // Find det tilsvarende billede i Filter Images\n  const filterItem = filterItems[i];\n\n  // Newsletter ID kommer fra det oprindelige emailId\n  const newsletterId = filterItem?.json?.emailId || '';\n\n  // Analyze image kan returnere outputtet direkte\n  // eller som et array.\n  let data = item.json;\n\n  if (Array.isArray(data)) {\n    data = data[0] || {};\n  }\n\n  // Hent selve teksten fra OpenAI-outputtet\n  const text =\n    data?.content?.[0]?.text ||\n    data?.output?.[0]?.content?.[0]?.text ||\n    '';\n\n  let analysis;\n\n  try {\n\n    const cleaned = text\n      .replace(/^```json\\s*/i, '')\n      .replace(/^```\\s*/i, '')\n      .replace(/\\s*```$/i, '')\n      .trim();\n\n    analysis = JSON.parse(cleaned);\n\n  } catch (error) {\n\n    analysis = {\n      raw_text: text,\n      parse_error: true\n    };\n\n  }\n\n  imageAnalyses.push({\n    image_number: i + 1,\n    newsletter_id: newsletterId,\n    analysis: analysis\n  });\n}\n\n\n// Brug newsletter ID fra det første billede\nconst newsletterId =\n  imageAnalyses[0]?.newsletter_id || '';\n\n\nreturn [\n  {\n    json: {\n      newsletter_id: newsletterId,\n      image_analyses: imageAnalyses\n    }\n  }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        288
+      ],
+      "id": "45e3a5e0-f387-4cb0-afcc-a54ee5997545",
+      "name": "Group Image Analyses"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "GPT-4O-MINI"
+        },
+        "responses": {
+          "values": [
+            {
+              "content": "=You are a senior marketing analyst working in a professional marketing department.\n\nYour task is to create ONE complete marketing analysis of ONE newsletter.\n\nThe newsletter should be analyzed as a complete marketing communication, combining:\n\n1. Newsletter metadata\n2. The text-based analysis\n3. The visual analysis of all relevant images\n\nDo NOT create separate analyses for individual images.\n\nThe final output represents ONE newsletter and will become ONE row in a marketing analysis database.\n\nIMPORTANT:\n\n- Return ONLY valid JSON.\n- Do not include Markdown.\n- Do not include ```json.\n- Do not add explanations before or after the JSON.\n- Do not invent facts.\n- Use reasonable marketing interpretation when it is strongly supported by the supplied content.\n- If something genuinely cannot be determined, use an empty string \"\" or an empty array [].\n- Keep the analysis concise but useful for marketing professionals.\n\n--------------------------------------------------\nNEWSLETTER METADATA\n--------------------------------------------------\n\nnewsletter_id:\n{{ $('Prepare Newsletter').first().json.newsletter_id }}\n\ndate:\n{{ $('Prepare Newsletter').first().json.date }}\n\nsender:\n{{ $('Prepare Newsletter').first().json.sender }}\n\nsubject:\n{{ $('Prepare Newsletter').first().json.subject }}\n\nUse the metadata above directly.\n\nDo NOT leave newsletter_id, date, sender or subject empty when the information is available above.\n\n--------------------------------------------------\nCOMPLETE MERGED NEWSLETTER DATA\n--------------------------------------------------\n\n{{ JSON.stringify($json) }}\n\n--------------------------------------------------\nCOMPANY / BRAND\n--------------------------------------------------\n\nIdentify the company or brand behind the newsletter using the available:\n\n- sender information\n- newsletter content\n- subject\n- visible branding\n- logos\n- visual identity\n- company references\n\nThe field \"company_brand\" should contain the recognizable company or brand name.\n\nDo not use the email address as the company_brand unless no better identification is possible.\n\n--------------------------------------------------\nANALYSIS REQUIREMENTS\n--------------------------------------------------\n\nAnalyze the newsletter as a marketing asset.\n\nConsider:\n\n- What the newsletter is trying to achieve\n- Who it is targeting\n- What product, service, event or topic it promotes\n- What value it communicates\n- How the copy is structured\n- How calls to action are used\n- Which persuasion techniques are used\n- Whether urgency or scarcity is present\n- What motivates the intended audience\n- The tone and copywriting style\n- How the brand is positioned\n- How images support the communication\n- How text and visuals work together\n- Recurring marketing patterns\n- Strengths\n- Weaknesses\n- The most important strategic marketing insight\n\n--------------------------------------------------\nVISUAL ANALYSIS\n--------------------------------------------------\n\nThe input contains analyses of multiple images from this newsletter.\n\nCombine ALL image analyses into ONE overall visual assessment.\n\nDo NOT describe each image separately in the final fields.\n\nFor the visual fields, identify the overall pattern across the newsletter:\n\n- visual strategy\n- visual style\n- image usage\n- text/image balance\n\nUse the image analyses as evidence.\n\nDo not invent visual characteristics that are not supported by the image analyses.\n\n--------------------------------------------------\nOUTPUT FORMAT\n--------------------------------------------------\n\nReturn exactly this JSON structure:\n\n{\n  \"newsletter_id\": \"\",\n  \"date\": \"\",\n  \"company_brand\": \"\",\n  \"sender\": \"\",\n  \"subject\": \"\",\n\n  \"newsletter_type\": \"\",\n  \"primary_goal\": \"\",\n  \"target_audience\": \"\",\n  \"main_product_or_service\": \"\",\n  \"main_offer\": \"\",\n  \"value_proposition\": \"\",\n  \"key_messages\": [],\n  \"call_to_actions\": [],\n  \"persuasion_techniques\": [],\n  \"urgency_or_scarcity\": \"\",\n  \"customer_motivation\": \"\",\n  \"tone_of_voice\": \"\",\n  \"copywriting_style\": \"\",\n  \"content_structure\": \"\",\n  \"promotional_strategy\": \"\",\n  \"brand_positioning\": \"\",\n\n  \"visual_strategy\": \"\",\n  \"visual_style\": \"\",\n  \"image_usage\": \"\",\n  \"text_image_balance\": \"\",\n\n  \"marketing_patterns\": [],\n\n  \"strengths\": [],\n  \"weaknesses\": [],\n  \"key_marketing_insight\": \"\"\n}\n\n--------------------------------------------------\nFIELD DEFINITIONS\n--------------------------------------------------\n\nnewsletter_id:\nUnique identifier of the newsletter/email. Use the supplied newsletter_id exactly.\n\ndate:\nDate of the newsletter. Use the supplied date exactly when available.\n\ncompany_brand:\nCompany or brand responsible for the newsletter.\n\nsender:\nOriginal sender information.\n\nsubject:\nOriginal newsletter subject.\n\nnewsletter_type:\nClassify the newsletter, for example:\n- Event Promotion\n- Product Promotion\n- Educational\n- Informational\n- Promotional\n- Company Update\n- Newsletter\n- Lead Generation\nUse the category that best describes the actual newsletter.\n\nprimary_goal:\nThe primary marketing objective.\n\nExamples:\n- Sales\n- Lead Generation\n- Event Attendance\n- Engagement\n- Brand Awareness\n- Education\n- Retention\n- Community Building\n\ntarget_audience:\nDescribe the intended audience as specifically as the evidence allows.\n\nmain_product_or_service:\nThe main product, service, event, organization or subject being promoted.\n\nmain_offer:\nThe concrete offer or proposition presented to the audience.\nIf there is no specific offer, use \"\".\n\nvalue_proposition:\nWhy the audience should care or what value is being offered.\n\nkey_messages:\nList the most important messages communicated by the newsletter.\n\ncall_to_actions:\nList the actual or clearly implied calls to action.\n\npersuasion_techniques:\nIdentify techniques such as:\n- Authority\n- Social Proof\n- Scarcity\n- Urgency\n- Exclusivity\n- Emotional Appeal\n- Problem/Solution\n- FOMO\nOnly include techniques supported by the newsletter.\n\nurgency_or_scarcity:\nDescribe any genuine urgency, deadline, limited availability, exclusivity or scarcity.\nIf none exists, use \"\".\n\ncustomer_motivation:\nWhy the target audience would act, read, click, attend, buy or engage.\n\ntone_of_voice:\nDescribe the overall tone.\n\ncopywriting_style:\nDescribe how the copy is written.\n\ncontent_structure:\nDescribe the overall structure of the newsletter.\n\npromotional_strategy:\nExplain how the newsletter attempts to achieve its marketing objective.\n\nbrand_positioning:\nDescribe how the company or brand positions itself through the newsletter.\n\nvisual_strategy:\nDescribe the overall strategic role of visuals in the newsletter.\n\nvisual_style:\nDescribe the overall visual aesthetic and design approach.\n\nimage_usage:\nExplain how images are used across the newsletter.\n\ntext_image_balance:\nDescribe the overall relationship between text and imagery.\n\nmarketing_patterns:\nIdentify notable recurring marketing patterns or tactics visible in the newsletter.\n\nstrengths:\nList the most important marketing strengths of the newsletter.\n\nweaknesses:\nList meaningful weaknesses, limitations or missed opportunities.\n\nkey_marketing_insight:\nGive ONE concise strategic takeaway that would be useful to a marketing professional studying this newsletter.\n\n--------------------------------------------------\nFINAL RULES\n--------------------------------------------------\n\nThe final JSON must represent the newsletter as a whole.\n\nDo not produce one result per image.\n\nDo not repeat image-specific analyses.\n\nDo not invent missing information.\n\nUse the available evidence from both text and images.\n\nReturn ONLY the JSON object."
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        2032,
+        16
+      ],
+      "id": "5ca29cc8-d05b-4f6b-b7d4-f0a523b57b52",
+      "name": "Combined Newsletter Analysis",
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1872,
+        16
+      ],
+      "id": "05856283-6e41-4485-a56e-caa6298a629a",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID",
+          "mode": "list",
+          "cachedResultName": "YOUR_SHEET_NAME",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/REPLACE_WITH_YOUR_GOOGLE_SHEET_ID/edit"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "your_tab_name",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/REPLACE_WITH_YOUR_GOOGLE_SHEET_ID/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "newsletter_id",
+              "displayName": "newsletter_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "date",
+              "displayName": "date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "company_brand",
+              "displayName": "company_brand",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "sender",
+              "displayName": "sender",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "subject",
+              "displayName": "subject",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "newsletter_type",
+              "displayName": "newsletter_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "primary_goal",
+              "displayName": "primary_goal",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "target_audience",
+              "displayName": "target_audience",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "main_product_or_service",
+              "displayName": "main_product_or_service",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "main_offer",
+              "displayName": "main_offer",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "value_proposition",
+              "displayName": "value_proposition",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "key_messages",
+              "displayName": "key_messages",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "call_to_actions",
+              "displayName": "call_to_actions",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "persuasion_techniques",
+              "displayName": "persuasion_techniques",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "urgency_or_scarcity",
+              "displayName": "urgency_or_scarcity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "customer_motivation",
+              "displayName": "customer_motivation",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "tone_of_voice",
+              "displayName": "tone_of_voice",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "copywriting_style",
+              "displayName": "copywriting_style",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "content_structure",
+              "displayName": "content_structure",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "promotional_strategy",
+              "displayName": "promotional_strategy",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "brand_positioning",
+              "displayName": "brand_positioning",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "visual_strategy",
+              "displayName": "visual_strategy",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "visual_style",
+              "displayName": "visual_style",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "image_usage",
+              "displayName": "image_usage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "text_image_balance",
+              "displayName": "text_image_balance",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "marketing_patterns",
+              "displayName": "marketing_patterns",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "strengths",
+              "displayName": "strengths",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "weaknesses",
+              "displayName": "weaknesses",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "key_marketing_insight",
+              "displayName": "key_marketing_insight",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        2512,
+        16
+      ],
+      "id": "cbbea0c4-0178-4900-95a9-4e854a3bd7b4",
+      "name": "Append row in sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nreturn items.map(item => {\n  const text = item.json.output?.[0]?.content?.[0]?.text || '';\n\n  const cleaned = text\n    .replace(/^```json\\s*/i, '')\n    .replace(/^```\\s*/i, '')\n    .replace(/\\s*```$/i, '')\n    .trim();\n\n  const data = JSON.parse(cleaned);\n\n  return {\n    json: data\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2320,
+        16
+      ],
+      "id": "6e1f1641-7eb6-49df-8ca8-d45ae92aa150",
+      "name": "Parse Final JSON"
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_GOOGLE_SHEET_ID",
+          "mode": "list",
+          "cachedResultName": "YOUR_SHEET_NAME",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/REPLACE_WITH_YOUR_GOOGLE_SHEET_ID/edit"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "your_tab_name",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/REPLACE_WITH_YOUR_GOOGLE_SHEET_ID/edit#gid=0"
+        },
+        "filtersUI": {
+          "values": []
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -544,
+        0
+      ],
+      "id": "f3286222-2e5c-4221-ab05-6a5084d57e08",
+      "name": "Get row(s) in sheet",
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const gmailItems = $('Get many messages').all();\nconst sheetItems = $('Get row(s) in sheet').all();\n\n// Alle newsletter IDs, der allerede findes i Google Sheets\nconst existingIds = new Set(\n  sheetItems\n    .map(item => String(item.json.newsletter_id ?? '').trim())\n    .filter(Boolean)\n);\n\n// Behold kun Gmail-mails, der IKKE allerede findes i Sheet\nconst newNewsletters = gmailItems.filter(item => {\n  const gmailId = String(item.json.id ?? '').trim();\n\n  return gmailId && !existingIds.has(gmailId);\n});\n\nreturn newNewsletters;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -368,
+        0
+      ],
+      "id": "b2c79423-e509-45e3-a669-2207cf1925bc",
+      "name": "Check Duplicate Newsletters"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -208,
+        0
+      ],
+      "id": "c16f0f90-d903-4065-bfdc-cae361bc2585",
+      "name": "Loop Over Items"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Get many messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get many messages": {
+      "main": [
+        [
+          {
+            "node": "Get row(s) in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Full Email": {
+      "main": [
+        [
+          {
+            "node": "Clean & Extract Email",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Extract Images",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean & Extract Email": {
+      "main": [
+        [
+          {
+            "node": "Prepare Newsletter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Newsletter": {
+      "main": [
+        [
+          {
+            "node": "Message a model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Images": {
+      "main": [
+        [
+          {
+            "node": "Split Images",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Images": {
+      "main": [
+        [
+          {
+            "node": "Download Image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Image": {
+      "main": [
+        [
+          {
+            "node": "Filter Images",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Images": {
+      "main": [
+        [
+          {
+            "node": "Analyze image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze image": {
+      "main": [
+        [
+          {
+            "node": "Group Image Analyses",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields": {
+      "main": [
+        [
+          {
+            "node": "Get Full Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Group Image Analyses": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Message a model": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Combined Newsletter Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Combined Newsletter Analysis": {
+      "main": [
+        [
+          {
+            "node": "Parse Final JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Final JSON": {
+      "main": [
+        [
+          {
+            "node": "Append row in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get row(s) in sheet": {
+      "main": [
+        [
+          {
+            "node": "Check Duplicate Newsletters",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Duplicate Newsletters": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Edit Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append row in sheet": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "REPLACE_WITH_YOUR_VERSION_ID",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "nodeGroups": [],
+  "id": "REPLACE_WITH_YOUR_WORKFLOW_ID",
+  "tags": []
+}
