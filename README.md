@@ -12,19 +12,16 @@ The purpose is to turn historical newsletter data into a reusable dataset for co
 
 ## Workflow
 
-Gmail
-↓
-Newsletter filtering
-↓
-Duplicate check
-↓
-Email extraction
-↓
-Text analysis ─────────┐
-                       ├→ Combined analysis → Google Sheets
-Image extraction       │
-↓                      │
-Image analysis ────────┘
+The pipeline follows a simple processing flow:
+
+**Gmail → Duplicate Check → Email Processing**
+
+The email is then processed through two analysis paths:
+
+- **Text Analysis** — analyzes newsletter copy, messaging and marketing strategy
+- **Image Analysis** — analyzes relevant visual content and image usage
+
+The two analysis paths are then combined into a single structured newsletter analysis and stored in Google Sheets.
 
 ### What it does
 
